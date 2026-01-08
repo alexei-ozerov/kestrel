@@ -18,8 +18,6 @@ var titleStyle = lipgloss.NewStyle().
 	Bold(true).
 	Italic(true).
 	PaddingLeft(2).
-	PaddingTop(2).
-	PaddingBottom(1).
 	Foreground(lipgloss.Color("#EE6FF8")).
 	BorderForeground(lipgloss.Color("240"))
 
@@ -31,6 +29,5 @@ var filterStyle = lipgloss.NewStyle().
 
 var welcomeStyle = lipgloss.NewStyle().
 	Bold(true).
-	PaddingTop(1).
 	PaddingLeft(2).
 	AlignHorizontal(lipgloss.Right)

@@ -4,12 +4,9 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"sort"
 	"strings"
 
 	kube "github.com/alexei-ozerov/kestrel/internal/kube"
-
-	"github.com/lithammer/fuzzysearch/fuzzy"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -25,11 +22,14 @@ const (
 )
 
 type model struct {
-	cursor          int
-	ready           bool
-	state           sessionState
+	cursor int
+	ready  bool
+	state  sessionState
+
 	viewportContent []string
 	filteredContent []string
+
+	modeText string
 
 	selectedGVR      string
 	selectedInstance string
@@ -38,26 +38,27 @@ type model struct {
 	searchInput textinput.Model
 
 	rawGVRData []kube.ApiResource
-}
 
-func extractNameFromGVR(allGVR []kube.ApiResource) []string {
-	var allGVRNameList []string
-	for _, res := range allGVR {
-		allGVRNameList = append(allGVRNameList, res.Name)
-	}
-
-	return allGVRNameList
+	version string
 }
 
 func initializeModel(resources []kube.ApiResource) model {
 	view := viewport.New(20, 20)
 
+	initialSelection := ""
+	if len(resources) > 0 {
+		initialSelection = extractNameFromGVR(resources)[len(resources)-1]
+	}
+
 	return model{
+		version:         "0.0.1", // TODO: extract from config or somewhere else
 		viewport:        view,
 		viewportContent: extractNameFromGVR(resources),
 		cursor:          len(resources) - 1, // Start at the bottom
 		searchInput:     textinput.New(),
 		rawGVRData:      resources,
+		modeText:        "[ RESOURCES ]",
+		selectedGVR:     initialSelection,
 	}
 }
 
@@ -81,17 +82,19 @@ func (m model) renderContent() string {
 	return b.String()
 }
 
-// TODO (ozerova): Improve this!
-func fuzzyFind(searchTerm string, data []string) []string {
-	rankedList := fuzzy.RankFind(searchTerm, data)
-	sort.Sort(rankedList)
+func (m *model) ResetViewport() {
+	m.viewportContent = extractNameFromGVR(m.rawGVRData)
+	m.cursor = len(m.rawGVRData) - 1
+	m.selectedGVR = m.viewportContent[m.cursor]
 
-	var sortedList []string
-	for _, entry := range rankedList {
-		sortedList = append(sortedList, entry.Target)
-	}
+	m.viewport.SetContent(m.renderContent())
+	m.syncScroll()
+}
 
-	return sortedList
+func (m *model) RefreshViewport() {
+	m.syncScroll()
+	m.selectedGVR = m.viewportContent[m.cursor]
+	m.viewport.SetContent(m.renderContent())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -105,17 +108,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "esc":
 				m.searchInput.Blur()
 				m.searchInput.Reset()
-				m.viewportContent = extractNameFromGVR(m.rawGVRData) // Should this data be here?
-				m.viewport.SetContent(m.renderContent())
-				return m, nil
 
+				m.modeText = "[ RESOURCES ]"
+				m.ResetViewport()
+
+				m.viewport, cmd = m.viewport.Update(msg)
+				cmds = append(cmds, cmd)
+
+				return m, tea.Batch(cmds...)
 			case "enter":
 				if len(m.filteredContent) > 0 {
 					m.searchInput.Blur()
+					// TODO (ozerova): should I do a m.searchInput.Reset() here?
+
 					m.viewportContent = m.filteredContent
 					m.cursor = 0
-					m.viewport.SetContent(m.renderContent())
-					return m, nil
+					m.modeText = "[ RESOURCES ]"
+
+					m.RefreshViewport()
+
+					m.viewport, cmd = m.viewport.Update(msg)
+					cmds = append(cmds, cmd)
+
+					return m, tea.Batch(cmds...)
 				}
 			}
 		}
@@ -131,7 +146,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.cursor = 0
-		m.viewport.SetContent(m.renderContent())
+		m.RefreshViewport()
 
 		return m, cmd
 	}
@@ -146,33 +161,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
-				m.syncScroll()
-				m.selectedGVR = m.viewportContent[m.cursor]
-				m.viewport.SetContent(m.renderContent())
+				m.RefreshViewport()
 			}
 
 		case "down", "j":
 			if m.cursor < len(m.viewportContent)-1 {
 				m.cursor++
-				m.syncScroll()
-				m.selectedGVR = m.viewportContent[m.cursor]
-				m.viewport.SetContent(m.renderContent())
+				m.RefreshViewport()
 			}
+
+		case "g":
+			// TODO: implement double tap logic
+			m.cursor = 0
+			m.RefreshViewport()
 
 		case "G":
 			m.cursor = len(m.viewportContent) - 1
-			m.syncScroll()
-			m.selectedGVR = m.viewportContent[m.cursor]
-			m.viewport.SetContent(m.renderContent())
+			m.RefreshViewport()
 
 		case "/":
+			m.modeText = "[ SEARCH ]"
 			return m, m.searchInput.Focus()
 
 		// Reset after search
 		case "esc":
-			m.viewportContent = extractNameFromGVR(m.rawGVRData)
-			m.viewport.SetContent(m.renderContent())
-			m.cursor = len(m.viewportContent) - 1
+			m.ResetViewport()
 		}
 
 	case tea.WindowSizeMsg:
@@ -198,34 +211,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m *model) syncScroll() {
-	if m.cursor < m.viewport.YOffset {
-		m.viewport.YOffset = m.cursor
-	}
-
-	if m.viewport.YOffset < 0 {
-		m.viewport.YOffset = 0
-	}
-
-	bottomBoundary := m.viewport.YOffset + m.viewport.Height
-	if m.cursor >= bottomBoundary {
-		m.viewport.YOffset = m.cursor - m.viewport.Height + 1
-	}
-
-	m.viewport.SetYOffset(m.viewport.YOffset)
-}
-
 func (m model) View() string {
+	header := titleStyle.Render("\nKestrel") + fmt.Sprintf(" v%s\n", m.version)
+
 	var footer string
 	if m.searchInput.Focused() {
-		footer = welcomeStyle.Render("[ Resources ] ") + fmt.Sprintf("%s", m.searchInput.Value())
+		footer = welcomeStyle.Render(m.modeText) + fmt.Sprintf(" %s", m.searchInput.Value())
 	} else {
-		footer = welcomeStyle.Render("[ Resources ] ") + fmt.Sprintf("%s", m.selectedGVR)
+		footer = welcomeStyle.Render(m.modeText) + fmt.Sprintf(" %s", m.selectedGVR)
 	}
 
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
-		titleStyle.Render("Kestrel"),
+		header,
 		m.viewport.View(),
 		footer,
 	)
@@ -237,7 +235,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	p := tea.NewProgram(initializeModel(resources), tea.WithAltScreen())
+	p := tea.NewProgram(initializeModel(resources))
 	if _, err := p.Run(); err != nil {
 		os.Exit(1)
 	}
