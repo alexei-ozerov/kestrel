@@ -4,40 +4,60 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 
 	kube "github.com/alexei-ozerov/kestrel/internal/kube"
 
+	"github.com/lithammer/fuzzysearch/fuzzy"
+
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
+type sessionState int
+
+const (
+	resourceTypeView sessionState = iota
+	resourceListView
+)
+
 type model struct {
-	viewport     viewport.Model
-	content      []string
-	contentSelection string
+	cursor          int
+	ready           bool
+	state           sessionState
+	viewportContent []string
+	filteredContent []string
 
-	resourceList []kube.ApiResource
-	cursorIndex  int
+	selectedGVR      string
+	selectedInstance string
 
-	ready        bool
+	viewport    viewport.Model
+	searchInput textinput.Model
+
+	rawGVRData []kube.ApiResource
+}
+
+func extractNameFromGVR(allGVR []kube.ApiResource) []string {
+	var allGVRNameList []string
+	for _, res := range allGVR {
+		allGVRNameList = append(allGVRNameList, res.Name)
+	}
+
+	return allGVRNameList
 }
 
 func initializeModel(resources []kube.ApiResource) model {
 	view := viewport.New(20, 20)
-	
-	var content []string
-	for _, res := range resources {
-		content = append(content, res.Name)
-	}
 
 	return model{
-		viewport: view,
-		resourceList: resources,
-		content: content,
-		contentSelection: content[len(content) - 1],
-		cursorIndex:  len(resources) - 1, // Start at the bottom
+		viewport:        view,
+		viewportContent: extractNameFromGVR(resources),
+		cursor:          len(resources) - 1, // Start at the bottom
+		searchInput:     textinput.New(),
+		rawGVRData:      resources,
 	}
 }
 
@@ -47,15 +67,13 @@ func (m model) Init() tea.Cmd {
 
 func (m model) renderContent() string {
 	var b strings.Builder
-	for i, item := range m.content {
-		if i == m.cursorIndex {
-			// Highlighted cursor line
+	for i, item := range m.viewportContent {
+		if i == m.cursor {
 			b.WriteString(selectedItemStyle.Render(fmt.Sprintf("%s", string(item))))
 		} else {
-			// Normal line
 			b.WriteString(itemStyle.Render(fmt.Sprintf("%s", string(item))))
 		}
-		if i < len(m.content)-1 {
+		if i < len(m.viewportContent)-1 {
 			b.WriteRune('\n')
 		}
 	}
@@ -63,34 +81,99 @@ func (m model) renderContent() string {
 	return b.String()
 }
 
+// TODO (ozerova): Improve this!
+func fuzzyFind(searchTerm string, data []string) []string {
+	rankedList := fuzzy.RankFind(searchTerm, data)
+	sort.Sort(rankedList)
+
+	var sortedList []string
+	for _, entry := range rankedList {
+		sortedList = append(sortedList, entry.Target)
+	}
+
+	return sortedList
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
 
+	if m.searchInput.Focused() {
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			switch msg.String() {
+			case "esc":
+				m.searchInput.Blur()
+				m.searchInput.Reset()
+				m.viewportContent = extractNameFromGVR(m.rawGVRData) // Should this data be here?
+				m.viewport.SetContent(m.renderContent())
+				return m, nil
+
+			case "enter":
+				if len(m.filteredContent) > 0 {
+					m.searchInput.Blur()
+					m.viewportContent = m.filteredContent
+					m.cursor = 0
+					m.viewport.SetContent(m.renderContent())
+					return m, nil
+				}
+			}
+		}
+
+		m.searchInput, cmd = m.searchInput.Update(msg)
+
+		term := m.searchInput.Value()
+		if term == "" {
+			m.viewportContent = extractNameFromGVR(m.rawGVRData)
+		} else {
+			m.filteredContent = fuzzyFind(term, extractNameFromGVR(m.rawGVRData))
+			m.viewportContent = m.filteredContent
+		}
+
+		m.cursor = 0
+		m.viewport.SetContent(m.renderContent())
+
+		return m, cmd
+	}
+
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
+
 		case "ctrl+c", "q":
 			return m, tea.Quit
 
 		case "up", "k":
-			if m.cursorIndex > 0 {
-				m.cursorIndex--
+			if m.cursor > 0 {
+				m.cursor--
+				m.syncScroll()
+				m.selectedGVR = m.viewportContent[m.cursor]
+				m.viewport.SetContent(m.renderContent())
 			}
 
 		case "down", "j":
-			if m.cursorIndex < len(m.content)-1 {
-				m.cursorIndex++
+			if m.cursor < len(m.viewportContent)-1 {
+				m.cursor++
+				m.syncScroll()
+				m.selectedGVR = m.viewportContent[m.cursor]
+				m.viewport.SetContent(m.renderContent())
 			}
 
 		case "G":
-			m.cursorIndex = len(m.content) - 1
+			m.cursor = len(m.viewportContent) - 1
 			m.syncScroll()
-		}
+			m.selectedGVR = m.viewportContent[m.cursor]
+			m.viewport.SetContent(m.renderContent())
 
-		m.contentSelection = m.content[m.cursorIndex]
-		m.viewport.SetContent(m.renderContent())
-		m.syncScroll()
+		case "/":
+			return m, m.searchInput.Focus()
+
+		// Reset after search
+		case "esc":
+			m.viewportContent = extractNameFromGVR(m.rawGVRData)
+			m.viewport.SetContent(m.renderContent())
+			m.cursor = len(m.viewportContent) - 1
+		}
 
 	case tea.WindowSizeMsg:
 		headerHeight := 4
@@ -116,28 +199,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) syncScroll() {
-    if m.cursorIndex < m.viewport.YOffset {
-        m.viewport.YOffset = m.cursorIndex
-    }
-
-	if m.viewport.YOffset < 0 {
-    	m.viewport.YOffset = 0
+	if m.cursor < m.viewport.YOffset {
+		m.viewport.YOffset = m.cursor
 	}
 
-    bottomBoundary := m.viewport.YOffset + m.viewport.Height
-    if m.cursorIndex >= bottomBoundary {
-        m.viewport.YOffset = m.cursorIndex - m.viewport.Height + 1
-    }
-    
-    m.viewport.SetYOffset(m.viewport.YOffset)
+	if m.viewport.YOffset < 0 {
+		m.viewport.YOffset = 0
+	}
+
+	bottomBoundary := m.viewport.YOffset + m.viewport.Height
+	if m.cursor >= bottomBoundary {
+		m.viewport.YOffset = m.cursor - m.viewport.Height + 1
+	}
+
+	m.viewport.SetYOffset(m.viewport.YOffset)
 }
 
 func (m model) View() string {
+	var footer string
+	if m.searchInput.Focused() {
+		footer = welcomeStyle.Render("[ Resources ] ") + fmt.Sprintf("%s", m.searchInput.Value())
+	} else {
+		footer = welcomeStyle.Render("[ Resources ] ") + fmt.Sprintf("%s", m.selectedGVR)
+	}
+
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		titleStyle.Render("Kestrel"),
 		m.viewport.View(),
-		welcomeStyle.Render("[ Resources ] ") + fmt.Sprintf("%s", m.contentSelection),
+		footer,
 	)
 }
 
